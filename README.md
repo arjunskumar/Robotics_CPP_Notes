@@ -1,4 +1,4 @@
-# Robotics & AI C++17 Notes
+# Modern Robotics & AI C++ Notes (C++17 / C++20 / C++23)
 
 ![C++ Intro](./imgs/cpp_intro.png)
 
@@ -26,6 +26,7 @@ Welcome to our Modern C++ Course, specifically tailored for Engineers focusing o
     - [Cementing Foundation: Config Manager](#module-02-foundation)
 3. [Module 03: I/O & Arithmetic](#module-03)
     - [Performance Checklist: I/O](#module-03-performance)
+    - [Modern C++23 Formatting: `std::println`](#module-03-println)
     - [Deep Dive: `std::chrono` — Timing](#module-03-chrono)
     - [Cementing Foundation: Telemetry Math](#module-03-foundation)
 4. [Module 04: Control Flow](#module-04)
@@ -61,6 +62,8 @@ Welcome to our Modern C++ Course, specifically tailored for Engineers focusing o
     - [RVO Optimization](#module-08-rvo)
     - [Lidar Filter Challenge](#module-08-challenge)
     - [Safe Returns (`std::optional`)](#module-08-optional)
+    - [C++ Exception Handling & Stack Unwinding](#module-08-exceptions-stack-unwinding)
+    - [C++23 Monadic `std::expected<T, E>`](#module-08-expected-monadic)
     - [`[[maybe_unused]]` Attribute](#module-08-maybe-unused)
     - [Cementing Foundation: Safety Callback](#module-08-foundation)
 9. [Module 09: Project Structure & CMake](#module-09)
@@ -742,6 +745,51 @@ double distance = std::hypot(dx, dy); // Result: 5.0 (without overflow risk)
 >
 > *   In production, raw `std::cout` is rarely used inside the core node. You'll use structured logging like `spdlog` or ROS 2's built-in `rclcpp::get_logger()`.
 > *   Always write safety-critical errors to `std::cerr` (not `cout`). It is unit-buffered and tied to `std::cout`, meaning errors flush after each output operation and show up instantly, even if the program crashes.
+
+<a name="module-03-println"></a>
+### Modern C++23 Formatting & Printing: `std::print` and `std::println`
+
+C++23 introduces the `<print>` library, fundamentally modernizing terminal output by combining Python/Rust-like format specifiers (`std::format`) with direct, highly-optimized OS stream I/O.
+
+#### Why `std::println` Replaces `std::cout` & `printf`
+
+1. **Automatic Newline Handling (`std::println`)**:
+   - `std::println("Hello World");` **automatically appends a newline character (`\n`)** to the stream! You no longer need manual `<< '\n'` or performance-killing `std::endl`.
+2. **`std::print` vs. `std::println`**:
+   - `std::print("Progress: {}%", 85);` — Prints text **without** appending a newline (ideal for progress bars or inline telemetry).
+   - `std::println("Status: OK");` — Prints text **and automatically appends a newline**.
+3. **Compile-Time Type Safety & Python-Style `{}` Syntax**:
+   - Uses `{}` format specifiers. Unlike unsafe C-style `printf("%s", num)`, modern C++ formatters validate format strings at compile time, eliminating buffer overflow risks and formatting type mismatches.
+4. **Performance & Real-Time Advantage**:
+   - Skips `std::ostream` operator overload (`<<`) cascades, locale conversion locks, and `stringstream` allocations. It writes formatted UTF-8 buffers directly to system file descriptors (e.g. `stdout`/`stderr`), making it significantly faster for high-frequency telemetry logging.
+
+```cpp
+#include <print>  // C++23 Header
+#include <cstdio> // For stderr redirect
+
+int main() {
+    // 1. Automatic newline addition with std::println
+    std::println("Robot Navigation Stack initialized successfully."); // Auto appends '\n'
+
+    // 2. Type-safe positional & precision formatting
+    double x = 3.14159, y = -2.71828;
+    int battery_level = 88;
+    std::println("Pose -> X: {:.2f}, Y: {:.2f} | Battery: {}%", x, y, battery_level);
+
+    // 3. Positional argument indexing {0}, {1}
+    std::println("Joint 1: {0}, Joint 2: {1}, Joint 1 again: {0}", 45.0, 90.0);
+
+    // 4. Output directly to stderr stream
+    std::println(stderr, "[WARN] Motor 3 temperature elevated: {}°C", 68.5);
+}
+```
+
+> | Mechanism | Auto Newline? | Type Safe? | Direct System Stream I/O? | Modern Syntax? |
+> |---|:---:|:---:|:---:|:---:|
+> | `std::cout << x << '\n';` | No (Manual `\n`) | Yes | No (`ostream` cascade) | Verbose |
+> | `printf("X: %f\n", x);` | No (Manual `\n`) | **No** (Unsafe runtime crash) | Yes | Legacy C |
+> | `std::print("X: {}\n", x);` | No (Manual `\n`) | Yes | Yes | Modern C++20/23 |
+> | **`std::println("X: {}", x);`** | **YES (Automatic)** | **Yes** | **Yes (Fastest)** | **Modern C++23** |
 
 <a name="module-03-chrono"></a>
 ### Deep Dive: `std::chrono` — Timing in Robotics
@@ -1913,14 +1961,11 @@ void onSensorData(double reading, [[maybe_unused]] int timestamp) {
 > **Rule of Thumb**: Use `[[maybe_unused]]` sparingly. If a parameter is *always* unused, consider removing it from the interface. If it's unused *only in some configurations* (e.g., debug vs release), `[[maybe_unused]]` is the correct tool.
 
 <a name="module-08-optional"></a>
-### Error Handling Philosophy: Exceptions vs `std::optional`
+### Safe Returns: `std::optional` (Value or Nothing)
 
 What happens when your `readSensor()` function fails because the Lidar unplugged?
 
-Most safety-critical robotics code (e.g., following MISRA/AUTOSAR standards) completely bans C++ exceptions via the `-fno-exceptions` compiler flag. 
-
-*   **Why?** Exceptions introduce non-deterministic stack unwinding latency. You cannot guarantee a 1000Hz control loop deadline if an exception is thrown.
-*   **The Solution**: Instead of throwing `std::runtime_error` or returning unsafe raw pointers, modern robotics utilities use `std::optional` (or C++23 `std::expected`) to mathematically and safely communicate that a function might fail to return a value.
+In modern C++, returning `std::optional<T>` allows functions to express that a return value may or may not exist, avoiding dangerous null pointer dereferences or arbitrary sentinel values (like `-999.0`).
 
 ```cpp
 #include <optional>
@@ -1950,34 +1995,254 @@ int main() {
 }
 ```
 
-#### Future-Proofing: C++23 `std::expected`
-While `std::optional` is perfect for "value or nothing", it doesn't tell you *why* a failure occurred (Was the Lidar unplugged? Did it overheat? Was it a timeout?). 
+<a name="module-08-exceptions-stack-unwinding"></a>
+### C++ Exception Handling & Stack Unwinding Mechanics
 
-C++23 introduces `std::expected<T, E>`. It returns either the expected value of type `T`, or an error of type `E`. This is rapidly becoming the standard in modern ROS 2 and embedded codebases because it provides detailed error data with zero exception-handling overhead.
+While safety-critical real-time robotics (MISRA C++ / AUTOSAR) often ban C++ exceptions via compiler flags (`-fno-exceptions`), understanding exceptions and **Stack Unwinding** is vital when working with host utilities, ROS 2 nodes, simulation tools (Gazebo/Webots), and general C++ application development.
+
+#### 1. How C++ Exception Handling Works (`try`, `catch`, `throw`)
+
+An exception represents an abnormal condition that interrupts normal execution flow. 
+- `throw`: Emits an exception object (usually derived from `std::exception`).
+- `try`: Demarcates a code block where exceptions might occur.
+- `catch`: Defines an exception handler for specific exception types.
 
 ```cpp
-#include <expected>
+#include <iostream>
+#include <stdexcept>
+#include <string>
 
-enum class SensorError { Timeout, Disconnected, Overheating };
+// Custom Exception for Robotics Domain
+class HardwareException : public std::runtime_error {
+public:
+    explicit HardwareException(const std::string& msg) 
+        : std::runtime_error("[HARDWARE ERROR] " + msg) {}
+};
 
-std::expected<double, SensorError> getPreciseRange() {
-    bool hardware_timeout = true; 
-    if (hardware_timeout) return std::unexpected(SensorError::Timeout);
-    return 12.5;
+struct LidarSensor {
+    std::string name;
+    
+    ~LidarSensor() {
+        std::cout << "[RAII Destructor] Cleaning up hardware lock for " << name << '\n';
+    }
+};
+
+void readLidarHardware() {
+    LidarSensor sensor{"RPLidar A3"};
+    std::cout << "Attempting hardware connection...\n";
+    
+    // Simulating sudden USB bus disconnect
+    throw HardwareException("USB Bus Read Timeout on /dev/ttyUSB0");
+}
+
+void processSensorPipeline() {
+    std::cout << "Entering processSensorPipeline()\n";
+    readLidarHardware();
+    std::cout << "This line will NEVER be executed due to exception!\n";
 }
 
 int main() {
-    auto result = getPreciseRange();
-    if (result.has_value()) {
-        std::cout << "Range: " << result.value() << "m\n";
-    } else {
-        // We now know exactly *why* it failed without throwing an exception!
-        if (result.error() == SensorError::Timeout) {
-            std::cerr << "Attempting to reconnect...\n";
-        }
+    try {
+        processSensorPipeline();
+    } catch (const HardwareException& ex) {
+        std::cerr << "Caught Domain Error: " << ex.what() << '\n';
+    } catch (const std::exception& ex) {
+        std::cerr << "Caught Standard Error: " << ex.what() << '\n';
+    } catch (...) {
+        std::cerr << "Caught Unknown Exception!\n";
     }
+    std::cout << "Program recovered cleanly and continues execution.\n";
 }
 ```
+
+#### 2. Deep Dive: What is Stack Unwinding?
+
+**Stack Unwinding** is the runtime process of unwinding active stack frames from the point of a `throw` up to the matching `catch` block.
+
+When a `throw` expression is executed:
+1. Normal execution pauses immediately.
+2. The runtime exception engine inspects the current function frame for a matching `try-catch` handler.
+3. If no handler exists in the current function:
+   - **Reverse-Order Destructor Execution**: All local automatic (stack-allocated) objects in that frame are destroyed in the **exact reverse order of their construction** (RAII cleanup).
+   - The current stack frame is **popped** from the call stack.
+4. The engine unwinds to the parent function frame and repeats the search.
+5. Once a matching `catch` block is found:
+   - Destructors for intermediate stack frames have all finished.
+   - Program execution resumes inside the body of the `catch` handler.
+
+> [!CAUTION]
+> **The `noexcept` & Destructor Golden Rule**: 
+> Never throw an exception inside a destructor during stack unwinding! If a destructor throws while unwinding another exception, C++ cannot handle two active exceptions simultaneously and immediately invokes `std::terminate()`, abruptly crashing your process.
+
+#### 3. Stack Unwinding Mermaid Flowchart
+
+```mermaid
+flowchart TD
+    subgraph Execution ["Stack Execution & Unwinding Pipeline"]
+        A["1. main() enters try block"] --> B["2. calls processSensorPipeline()"]
+        B --> C["3. calls readLidarHardware()"]
+        C --> D["4. THROW HardwareException"]
+        
+        D --> E["5. STACK UNWINDING BEGINS"]
+        E --> F["Execute ~LidarSensor() in readLidarHardware() frame"]
+        F --> G["Pop readLidarHardware() stack frame"]
+        
+        G --> H["Unwind processSensorPipeline() frame (Destroy local objects)"]
+        H --> I["Pop processSensorPipeline() stack frame"]
+        
+        I --> J["6. Match catch(const HardwareException&) in main()"]
+        J --> K["7. Program resumes safely in main() catch block"]
+    end
+
+    style D fill:#ff9999,stroke:#333,stroke-width:2px
+    style E fill:#ffcc99,stroke:#333,stroke-width:2px
+    style K fill:#99ff99,stroke:#333,stroke-width:2px
+```
+
+#### 4. Stack Unwinding Memory Frame Architecture (ASCII Diagram)
+
+```text
+================================================================================
+                    C++ STACK UNWINDING MEMORY LAYOUT
+================================================================================
+
+ [STACK BOTTOM] (Higher Memory Addresses)
+ +----------------------------------------------------------------------------+
+ | main() Frame                                                               |
+ |   - try { processSensorPipeline(); }                                      |
+ |   - catch (const HardwareException& ex) <--- [TARGET CATCH FOUND HERE!]    |
+ +----------------------------------------------------------------------------+
+       ^
+       | Unwinds to parent frame
+ +----------------------------------------------------------------------------+
+ | processSensorPipeline() Frame                                              |
+ |   - MotorGuard motor_guard;  <--- 2nd Destructor Executed (~MotorGuard)    |
+ |   - PipelineState state;     <--- 1st Destructor Executed (~State)         |
+ |   - calls readLidarHardware()                                              |
+ +----------------------------------------------------------------------------+
+       ^
+       | Unwinds frame (Pops frame)
+ +----------------------------------------------------------------------------+
+ | readLidarHardware() Frame                                                  |
+ |   - LidarSensor sensor;      <--- 0th Destructor Executed (~LidarSensor)   |
+ |   - THROW HardwareException! <--- [EXCEPTION ORIGIN]                       |
+ +----------------------------------------------------------------------------+
+ [STACK TOP] (Lower Memory Addresses)
+
+ ========================== UNWINDING STEP-BY-STEP ============================
+ 1. Exception thrown inside readLidarHardware().
+ 2. Runtime checks readLidarHardware() for handler -> None found.
+ 3. Destructor ~LidarSensor() runs -> Stack frame readLidarHardware() POPPED.
+ 4. Control unwinds to processSensorPipeline() -> None found.
+ 5. Destructors ~PipelineState() then ~MotorGuard() run -> Frame POPPED.
+ 6. Control unwinds to main() -> Matching catch(HardwareException&) FOUND!
+ 7. Stack unwinding halts; execution continues inside main()'s catch block.
+================================================================================
+```
+
+<a name="module-08-expected-monadic"></a>
+### C++23 Monadic `std::expected<T, E>` (Value or Detailed Error)
+
+While `std::optional` provides "value or nothing", it doesn't convey *why* an operation failed. Conversely, C++ exceptions convey error details but suffer from non-deterministic stack unwinding latency.
+
+C++23 introduces **`std::expected<T, E>`** (`<expected>`), offering the perfect balance: it returns either an expected value of type `T` or a detailed error of type `E` **with zero exception overhead and deterministic performance**.
+
+#### 1. Core Mechanics: `T` or `std::unexpected<E>`
+
+```cpp
+#include <expected>
+#include <iostream>
+#include <string>
+
+enum class ControllerError {
+    DeviceOffline,
+    Overheating,
+    InvalidCommand,
+    LowVoltage
+};
+
+// Returns double on success, or ControllerError on failure
+std::expected<double, ControllerError> getJointAngle(int joint_id) {
+    if (joint_id < 0 || joint_id > 6) {
+        return std::unexpected(ControllerError::InvalidCommand);
+    }
+    bool hardware_ok = false;
+    if (!hardware_ok) {
+        return std::unexpected(ControllerError::DeviceOffline);
+    }
+    return 45.2; // Returns success value
+}
+```
+
+#### 2. C++23 Monadic Operations (`.and_then()`, `.transform()`, `.or_else()`)
+
+C++23 elevates `std::expected` into a **monadic error processing pipeline**, allowing functional chaining of dependent operations without nested `if/else` checks.
+
+- **`.and_then(fn)`**: Monadic bind. Calls `fn` (which returns another `std::expected`) **only if** the current expected object has a value.
+- **`.transform(fn)`**: Monadic map. Transforms the value inside `std::expected` using `fn` (which returns raw value `U`), wrapping the result back in `std::expected<U, E>`.
+- **`.or_else(fn)`**: Monadic error handling. Executes `fn` **only if** an error occurred, allowing fallback recovery or error translation.
+- **`.value_or(default_val)`**: Unwraps the value, returning `default_val` if an error occurred.
+
+```cpp
+#include <expected>
+#include <iostream>
+#include <cmath>
+
+enum class ProcessingError {
+    InvalidRawData,
+    CalculationOverflow,
+    OutofBounds
+};
+
+// Step 1: Read raw encoder ticks
+std::expected<int, ProcessingError> readEncoderTicks() {
+    bool sensor_ok = true;
+    if (!sensor_ok) return std::unexpected(ProcessingError::InvalidRawData);
+    return 2048;
+}
+
+// Step 2: Convert ticks to radians (returns std::expected)
+std::expected<double, ProcessingError> ticksToRadians(int ticks) {
+    if (ticks < 0) return std::unexpected(ProcessingError::InvalidRawData);
+    constexpr double ticks_per_rev = 4096.0;
+    return (ticks / ticks_per_rev) * 2.0 * M_PI;
+}
+
+// Step 3: Normalize angle (returns raw double for .transform)
+double normalizeAngle(double rad) {
+    return std::fmod(rad, 2.0 * M_PI);
+}
+
+int main() {
+    // -------------------------------------------------------------------------
+    // Monadic Pipeline: readEncoderTicks -> ticksToRadians -> normalizeAngle
+    // -------------------------------------------------------------------------
+    auto final_angle = readEncoderTicks()
+        .and_then(ticksToRadians)    // Chained step returning std::expected
+        .transform(normalizeAngle)   // Transformation step returning value
+        .or_else([](ProcessingError err) -> std::expected<double, ProcessingError> {
+            std::cerr << "[RECOVERY] Encoder read failed! Substituting 0.0 rad fallback.\n";
+            return 0.0; // Fallback recovery
+        });
+
+    if (final_angle.has_value()) {
+        std::cout << "Processed Angle: " << *final_angle << " rad\n";
+    }
+
+    // Safe extraction with default fallback
+    double safe_val = final_angle.value_or(0.0);
+    std::cout << "Safe Angle: " << safe_val << " rad\n";
+}
+```
+
+#### 3. Error Handling Architecture Comparison Matrix
+
+> | Strategy | Convey Error Detail? | Deterministic Latency? | Compatible with `-fno-exceptions`? | Monadic Chaining Support? | Ideal Robotics Use Case |
+> |---|:---:|:---:|:---:|:---:|---|
+> | **C++ Exceptions** (`try/catch`) | Yes (`std::exception`) | **No** (Unwinding jitter) | No | No | Non-real-time tools, configuration loading, GUI app setup |
+> | **`std::optional<T>`** | No (Value or None) | **Yes** (Zero overhead) | Yes | Yes (C++23) | Simple getters, optional sensor readings |
+> | **`std::error_code`** | Yes (System codes) | **Yes** | Yes | No | Low-level C-style system APIs |
+> | **`std::expected<T, E>` (C++23)** | **Yes (Rich Error Type `E`)** | **Yes (Zero overhead)** | **Yes** | **Yes (`.and_then()`, `.transform()`)** | **Modern ROS 2 nodes, real-time control loops, hardware drivers** |
 
 <a name="module-08-foundation"></a>
 ### Foundation Cementing: The Callback-Driven Logic
