@@ -51,6 +51,7 @@ Welcome to our Modern C++ Course, specifically tailored for Engineers focusing o
     - [POD Structs](#module-06-pod)
     - [`enum` vs `enum class`](#module-06-enum)
     - [Cementing Foundation: Telemetry Pack/Unpack](#module-06-foundation)
+    - [Safe Hardware Deserialization: `std::bit_cast` & `std::endian`](#module-06-bit-cast)
 7. [Module 07: Memory & Ownership](#module-07)
     - [Memory Bridge: Interlude](#module-07-interlude)
     - [Pointers vs. References](#module-07-pointers)
@@ -106,6 +107,8 @@ Welcome to our Modern C++ Course, specifically tailored for Engineers focusing o
     - [Asynchronous Tasks: `std::async` & `std::future`](#module-12-async)
     - [Concurrency Pitfalls](#module-12-pitfalls)
     - [Lock-Free Primitives: `std::atomic`](#module-12-atomic)
+    - [Lock-Free SPSC Ring Buffer (Zero-Mutex 1kHz Streaming)](#module-12-spsc)
+    - [Real-Time Linux Thread Hardening](#module-12-rt-hardening)
     - [Cementing Foundation: Telemetry Worker](#module-12-foundation)
 13. [Module 13: Production Deployment & Tooling](#module-13)
     - [Static Analysis & Sanitizers](#module-13-sanitizers)
@@ -135,6 +138,8 @@ Welcome to our Modern C++ Course, specifically tailored for Engineers focusing o
 18. [Appendix B: Production Design Patterns](#appendix-b)
 19. [Appendix C: Testing Discipline](#appendix-c)
 20. [Appendix D: ROS 2 Senior Insights](#appendix-d)
+    - [Node Architecture & Callbacks](#appendix-d-node-arch)
+    - [Zero-Copy IPC with Loaned Messages](#appendix-d-zero-copy)
 
 
 ---
@@ -149,7 +154,7 @@ C++ is a high-performance, compiled language created by Bjarne Stroustrup. In ro
 > **Design Philosophy**: This module is designed to demystify the "black box" of how code reaches hardware. Robotics involves diverse hardware (ARM/x86); if you don't understand the **Linker vs. Compiler**, you will be paralyzed by the first library error you hit in ROS.
 
 > [!NOTE]
-> **Modern C++ (C++17)**: This course focuses specifically on the **C++17 Standard**, which introduced critical robotics features like `std::optional`, `std::string_view`, and structured bindings.
+> **Modern C++ Evolution (C++17 / C++20 / C++23)**: This course establishes production fundamentals on the **C++17 Standard** (e.g., `std::optional`, `std::string_view`, structured bindings), and systematically integrates game-changing **C++20** features (Concepts, Ranges/Views, `std::span`, `std::jthread`, `<bit>`) and **C++23** additions (`std::println`, monadic `std::expected`, explicit object parameters) for mission-critical robotics engineering.
 
 > In the world of Robotics, C++ is the undisputed king. It provides zero-cost abstractions—high-level features that compile into highly efficient machine code. When processing point clouds from a LIDAR at 10Hz or calculating inverse kinematics for a robot arm in under a millisecond, performance is critical.
 
@@ -231,15 +236,15 @@ The **One Definition Rule (ODR)** is a foundational C++ rule that dictates how e
 
 | Code Placement | Multiple Includes Behavior | Linker Result | Correct Fix |
 | :--- | :--- | :--- | :--- |
-| **Non-inline function definition in header** | Function compiled into multiple `.o` files | ❌ `multiple definition of 'read_sensor()'` | Mark function `inline` or move definition to `.cpp` |
-| **Global variable definition in header** | Symbol defined in multiple object files | ❌ `multiple definition of 'robot_id'` | Declare as `extern int robot_id;` in header, define in ONE `.cpp` |
-| **Class / Struct definition in header** | Included across multiple `.cpp` files | ✅ OK (guarded by `#pragma once`) | Ensure `#pragma once` is present |
-| **`inline` function / template in header** | Included across multiple `.cpp` files | ✅ OK (ODR exempt by standard) | Header-only implementation allowed |
+| **Non-inline function definition in header** | Function compiled into multiple `.o` files | FAIL: `multiple definition of 'read_sensor()'` | Mark function `inline` or move definition to `.cpp` |
+| **Global variable definition in header** | Symbol defined in multiple object files | FAIL: `multiple definition of 'robot_id'` | Declare as `extern int robot_id;` in header, define in ONE `.cpp` |
+| **Class / Struct definition in header** | Included across multiple `.cpp` files | PASS: OK (guarded by `#pragma once`) | Ensure `#pragma once` is present |
+| **`inline` function / template in header** | Included across multiple `.cpp` files | PASS: OK (ODR exempt by standard) | Header-only implementation allowed |
 
 **Real-World Robotics ODR Pitfall (Linker Error):**
 
 ```cpp
-// ❌ BAD: LidarUtils.hpp (Header file)
+// BAD: LidarUtils.hpp (Header file)
 #pragma once
 
 // Linker error if included by more than one .cpp file!
@@ -253,7 +258,7 @@ void reset_lidar() {
 **Correct Modern C++ Fix:**
 
 ```cpp
-// ✅ GOOD: LidarUtils.hpp
+// GOOD: LidarUtils.hpp
 #pragma once
 
 // inline variables (C++17) and inline functions allow safe multi-TU inclusion!
@@ -1751,6 +1756,73 @@ int main() {
     std::cout << "Gravity Vector Y: " << ay << " m/s^2 at T=" << time_ns << "ns\n";
 }
 ```
+
+<a name="module-06-bit-cast"></a>
+### Safe Hardware Deserialization: `std::bit_cast` & `std::endian` (C++20)
+
+Robotics systems continuously ingest raw byte frames from physical hardware interfaces: CAN bus (SocketCAN), UART serial packets, EtherCAT frames, and SPI sensor registers.
+
+#### The Unsafe Legacy Approach: Undefined Behavior
+
+Traditionally, C and legacy C++ code parsed bytes using `reinterpret_cast` or `union` type-punning:
+
+```cpp
+// DANGEROUS: Undefined Behavior under strict aliasing rules
+uint8_t raw_bytes[4] = {0x00, 0x00, 0x80, 0x3F}; // 1.0f in IEEE-754 little-endian
+float bad_val = *(reinterpret_cast<float*>(raw_bytes)); // Violates C++ strict aliasing!
+```
+
+Modern compilers with optimizations enabled (`-O2` or `-O3`) assume two pointers of different types never alias the same memory address. This code can silently read stale registers, produce garbage values, or be optimized away entirely.
+
+#### The Modern Solution: `std::bit_cast` (`<bit>`)
+
+C++20 introduces `std::bit_cast<To>(from)`, which provides a **compiler-verified, zero-cost, type-safe** way to re-interpret object bits. Both types must have the same size and be trivially copyable. It operates at compile-time (`constexpr`) whenever inputs are constant expressions.
+
+#### Handling Byte Order: `std::endian`
+
+CAN bus sensors (e.g., radar, wheel speed encoders) often transmit payload words in **Big-Endian** (network byte order), whereas x86 and ARM processors (e.g., Raspberry Pi, Jetson) execute in **Little-Endian**. C++20 `<bit>` provides `std::endian` to detect architecture byte order portably.
+
+```cpp
+#include <iostream>
+#include <cstdint>
+#include <bit>
+#include <array>
+#include <algorithm>
+
+// Packed POD struct representing a motor feedback CAN frame (8 bytes)
+struct MotorCanPayload {
+    int16_t encoder_ticks; // 2 bytes
+    int16_t motor_current; // 2 bytes
+    float   board_temp;    // 4 bytes
+};
+static_assert(sizeof(MotorCanPayload) == 8, "Payload must match exactly 8-byte CAN frame");
+
+int main() {
+    // Simulated raw 8-byte frame received from CAN socket
+    std::array<uint8_t, 8> can_frame = {
+        0xE8, 0x03,             // 1000 ticks (Little-Endian)
+        0x64, 0x00,             // 100 mA (Little-Endian)
+        0x00, 0x00, 0x20, 0x42  // 40.0 deg C (IEEE-754 float: 0x42200000)
+    };
+
+    // 1. Bit-cast raw bytes into structured data with zero UB and zero runtime copy overhead
+    auto telemetry = std::bit_cast<MotorCanPayload>(can_frame);
+
+    std::cout << "[CAN] Encoder: " << telemetry.encoder_ticks << " ticks\n";
+    std::cout << "[CAN] Current: " << telemetry.motor_current << " mA\n";
+    std::cout << "[CAN] Temp:    " << telemetry.board_temp << " C\n";
+
+    // 2. Portable Endianness Check
+    if constexpr (std::endian::native == std::endian::little) {
+        // Native architecture is Little-Endian (Standard for x86_64 and aarch64 Jetson)
+    } else if constexpr (std::endian::native == std::endian::big) {
+        // Native architecture is Big-Endian
+    }
+}
+```
+
+> [!TIP]
+> **Production Recommendation**: When decoding CAN bus or serial streams, never cast raw byte pointers (`(float*)buf`). Always prefer `std::bit_cast` for scalar/struct conversions and `std::endian` to guarantee deterministic hardware decoding across platforms.
 
 ---
 
@@ -3939,6 +4011,161 @@ int main() {
 ```
 `std::atomic` is the secret to high-performance, real-time safe status sharing.
 
+<a name="module-12-spsc"></a>
+### Lock-Free SPSC Ring Buffer (Zero-Mutex 1kHz Streaming)
+
+In real-time robotics architectures, a high-frequency sensor thread (e.g., 1000Hz IMU reader or EtherCAT servo loop) produces telemetry that a control loop consumes. 
+
+#### Why Mutexes Fail in Hard Real-Time Loops
+
+1. **Lock Contention & Latency Spikes**: A mutex forces the OS kernel to intervene when contention occurs, putting threads to sleep. A 1ms control deadline can easily be missed if thread wake-up latency fluctuates between 50µs and 5ms.
+2. **Priority Inversion**: If a non-real-time logging thread holds the mutex and gets preempted by an unrelated process, the safety-critical motor thread is blocked.
+
+#### The Architecture: Single Producer Single Consumer (SPSC)
+
+If exactly **one thread writes** and **one thread reads**, you can achieve thread safety with zero mutexes, zero allocations, and zero blocking using an array-backed circular buffer and atomic indices with **Acquire/Release memory ordering**.
+
+```cpp
+#include <array>
+#include <atomic>
+#include <optional>
+#include <cstddef>
+#include <iostream>
+#include <thread>
+
+template <typename T, std::size_t Capacity>
+class SpscRingBuffer {
+    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of 2 for fast bitwise modulo");
+
+public:
+    SpscRingBuffer() : head_(0), tail_(0) {}
+
+    // Producer only: push sensor packet without blocking
+    bool push(const T& item) {
+        const std::size_t current_tail = tail_.load(std::memory_order_relaxed);
+        const std::size_t current_head = head_.load(std::memory_order_acquire);
+
+        if ((current_tail - current_head) >= Capacity) {
+            return false; // Buffer full: drop or record overrun
+        }
+
+        buffer_[current_tail & (Capacity - 1)] = item;
+        // Release: ensures data write is visible before tail index updates
+        tail_.store(current_tail + 1, std::memory_order_release);
+        return true;
+    }
+
+    // Consumer only: pop sensor packet without blocking
+    std::optional<T> pop() {
+        const std::size_t current_head = head_.load(std::memory_order_relaxed);
+        const std::size_t current_tail = tail_.load(std::memory_order_acquire);
+
+        if (current_head == current_tail) {
+            return std::nullopt; // Buffer empty
+        }
+
+        T item = buffer_[current_head & (Capacity - 1)];
+        // Release: ensures data read finishes before head index updates
+        head_.store(current_head + 1, std::memory_order_release);
+        return item;
+    }
+
+private:
+    std::array<T, Capacity> buffer_;
+
+    // alignas(64) separates head and tail onto different cache lines, preventing false sharing!
+    alignas(64) std::atomic<std::size_t> head_;
+    alignas(64) std::atomic<std::size_t> tail_;
+};
+
+struct ImuReading {
+    float ax, ay, az;
+    uint64_t timestamp_ns;
+};
+
+int main() {
+    SpscRingBuffer<ImuReading, 1024> imu_queue;
+
+    // Fast lock-free push from high-rate hardware interrupt thread
+    imu_queue.push({0.01f, -9.81f, 0.02f, 1000234000ULL});
+
+    // Fast lock-free pop from control loop
+    if (auto reading = imu_queue.pop()) {
+        std::cout << "[SPSC] Popped IMU Az: " << reading->az << " m/s^2\n";
+    }
+}
+```
+
+---
+
+<a name="module-12-rt-hardening"></a>
+### Real-Time Linux Thread Hardening (SCHED_FIFO, CPU Affinity, mlockall)
+
+By default, standard C++ threads (`std::thread` / `std::jthread`) run under Linux's standard `SCHED_OTHER` round-robin scheduler. In robotics, this means the kernel scheduler can interrupt your motor loop at any instant to run background desktop or OS maintenance tasks.
+
+To achieve microsecond-deterministic latency, production robotics software uses native OS primitives to configure three layers of real-time guarantees:
+
+```cpp
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+
+// Hardens the calling process and thread for hard real-time execution
+bool harden_realtime_thread(std::thread& th, int core_id, int priority_level = 80) {
+    // 1. Lock memory pages into RAM: Prevents page faults and swap disk jitter
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        std::cerr << "[RT WARN] mlockall failed: Run with root/CAP_SYS_NICE permissions\n";
+    }
+
+    // 2. CPU Core Affinity: Pin thread to dedicated CPU core (e.g., core isolated via isolcpus)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    int rc = pthread_setaffinity_np(th.native_handle(), sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        std::cerr << "[RT ERROR] Failed to pin thread to CPU core " << core_id << '\n';
+        return false;
+    }
+
+    // 3. Set Real-Time Scheduler: SCHED_FIFO (First In, First Out real-time priority)
+    sched_param sch_params;
+    sch_params.sched_priority = priority_level; // Priority 1 to 99
+    rc = pthread_setschedparam(th.native_handle(), SCHED_FIFO, &sch_params);
+    if (rc != 0) {
+        std::cerr << "[RT ERROR] Failed to set SCHED_FIFO priority\n";
+        return false;
+    }
+
+    return true;
+}
+
+void realtime_motor_loop() {
+    // Deterministic 1kHz (1ms) loop
+    auto next_wake = std::chrono::steady_clock::now();
+    for (int i = 0; i < 5; ++i) {
+        next_wake += std::chrono::milliseconds(1);
+        // Execute control math here...
+        std::this_thread::sleep_until(next_wake);
+    }
+}
+
+int main() {
+    std::thread control_thread(realtime_motor_loop);
+    
+    // Pin to CPU Core 2 with high real-time priority 80
+    harden_realtime_thread(control_thread, 2, 80);
+
+    control_thread.join();
+    std::cout << "[RT] Hardened control loop executed.\n";
+}
+```
+
+> [!IMPORTANT]
+> **PREEMPT_RT Kernel**: Linux standard kernels cannot guarantee hard real-time bounds. For production robots (e.g., EtherCAT master, autonomous vehicles), run on a Linux kernel patched with `PREEMPT_RT`.
+
 <a name="module-12-foundation"></a>
 ### Foundation Cementing: The Telemetry Worker
 A robust example of a thread-safe telemetry system using `std::mutex` and `std::atomic`.
@@ -5007,6 +5234,7 @@ TEST(ControllerTest, HandlesObstacle) {
 ## Appendix D: ROS 2 Senior Insights
 Applying C++ concepts specifically to the ROS 2 (rclcpp) ecosystem.
 
+<a name="appendix-d-node-arch"></a>
 ### Node Architecture
 Don't put all logic inside a ROS node. Decouple your math from the ROS middleware wrapper.
 `[ROS 2 Sensor Callback] → [Pure C++ Processing Class] → [ROS 2 Publisher]`
@@ -5019,6 +5247,75 @@ If your `<LaserScan>` callback has a `sleep()` or a long `while()` loop, the nod
 ### Executors
 *   **Single-Threaded Executor**: Deterministic, safer, no mutexes required between callbacks. The default.
 *   **Multi-Threaded Executor**: Runs callbacks in parallel. **Massive Risk**: You *must* protect shared class variables with `std::mutex` or `std::atomic`, or you will cause a data race. Do not switch to this simply because "parallel is faster" unless you have rigorously proven thread safety.
+
+<a name="appendix-d-zero-copy"></a>
+### Zero-Copy IPC with Loaned Messages (`rclcpp::LoanedMessage`)
+
+In vision-guided robotics and autonomous navigation, nodes transfer high-bandwidth data streams: 4K camera frames (30MB/frame), 3D point clouds (10MB/frame), and dense occupancy grids.
+
+#### The Standard Pipeline Problem: Multiple Memory Copies
+
+By default, publishing a standard ROS 2 message:
+1. Allocates memory on the publisher heap.
+2. Copies data into the DDS middleware serialization buffer.
+3. Transmits over shared memory or loopback sockets.
+4. Deserializes and copies into the subscriber's heap memory.
+
+At 60 FPS, this saturates memory bus bandwidth, causes cache evictions, and adds 5ms–20ms of serialization latency.
+
+#### The Zero-Copy Solution: Borrowed Messages via Shared Memory
+
+Using a shared-memory middleware (e.g., Eclipse Iceoryx with CycloneDDS / FastDDS), ROS 2 allows the publisher to **borrow a pre-allocated buffer directly from shared memory**. The sensor writes pixels directly into this buffer, and the subscriber reads from that exact same physical address:
+
+```cpp
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+
+class HighRateCameraNode : public rclcpp::Node {
+public:
+    HighRateCameraNode() : Node("high_rate_camera") {
+        // Publisher configured for loaned messages
+        pub_ = this->create_publisher<sensor_msgs::msg::Image>("camera/image_raw", 10);
+        timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(33), // ~30 FPS
+            std::bind(&HighRateCameraNode::capture_and_publish, this)
+        );
+    }
+
+private:
+    void capture_and_publish() {
+        // 1. Borrow a pre-allocated buffer directly from shared memory (Iceoryx)
+        rclcpp::LoanedMessage<sensor_msgs::msg::Image> loaned_msg = pub_->borrow_loaned_message();
+
+        if (!loaned_msg.is_valid()) {
+            RCLCPP_WARN(this->get_logger(), "Zero-copy shared memory buffer loan failed! Falling back to heap.");
+            return;
+        }
+
+        // 2. Direct write: Hardware driver writes pixel bytes directly into shared buffer
+        sensor_msgs::msg::Image& img = loaned_msg.get();
+        img.width = 1920;
+        img.height = 1080;
+        img.encoding = "rgb8";
+        img.step = 1920 * 3;
+        img.data.resize(img.height * img.step); // Sized inside pre-allocated shared memory
+
+        // Simulated camera DMA direct write
+        std::fill(img.data.begin(), img.data.end(), 128);
+
+        // 3. Publish transfers ownership via shared memory pointer: ZERO COPIES!
+        pub_->publish(std::move(loaned_msg));
+    }
+
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_;
+    rclcpp::TimerBase::SharedPtr timer_;
+};
+```
+
+> [!TIP]
+> **Requirements for True Zero-Copy in ROS 2**:
+> 1. Message types must be **Plain Old Data (POD) / fixed-size** (types with variable-size fields like `std::string` or unbound vectors require specialized fixed-capacity representations).
+> 2. Both nodes must run on the **same host OS** with shared memory transport enabled (e.g., Iceoryx configured in `cyclonedds.xml`).
 
 ---
 
