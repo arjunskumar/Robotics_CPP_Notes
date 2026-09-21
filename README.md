@@ -43,6 +43,7 @@ Welcome to our Modern C++ Course, specifically tailored for Engineers focusing o
     - [Deep Dive: STL Algorithms](#module-05-algorithms)
     - [STL Algorithms: `std::minmax` & `std::count_if`](#module-05-minmax-countif)
     - [Erasing Vector Elements: `std::erase_if`](#module-05-erase-if)
+    - [C++20 Ranges & Views (`<ranges>`, `std::views`)](#module-05-ranges)
     - [Iterator Invalidation](#module-05-invalidation)
     - [Deep Dive: Real-Time Golden Rule](#module-05-real-time)
     - [Cementing Foundation: Cloud Filter](#module-05-foundation)
@@ -84,6 +85,7 @@ Welcome to our Modern C++ Course, specifically tailored for Engineers focusing o
     - [State & Behavior](#module-10-members)
     - [Interaction & Safety](#module-10-interaction)
     - [Object Identity (`this`)](#module-10-identity)
+    - [C++23 Explicit Object Parameters: Deducing this](#module-10-deducing-this)
     - [Creation & Destruction](#module-10-creation)
     - [Advanced Mechanics](#module-10-advanced)
 11. [Module 11: Templates & Polymorphism](#module-11)
@@ -1451,6 +1453,87 @@ std::erase_if(cloud, [](const Point2D& p) {
 
 > [!WARNING]
 > **Iterator Invalidation Alert**: Calling `.erase()` on a vector invalidates all iterators pointing to or past the erased element. Never attempt to call `vec.erase(it)` inside a standard `for (auto element : vec)` loop! Always use `std::erase_if` or store returned iterators: `it = vec.erase(it);`.
+
+<a name="module-05-ranges"></a>
+### Modern C++20 Ranges & Views (`<ranges>`, `std::views`)
+
+In robotics, sensor processing loops (LiDAR, Radar, IMU, Vision) repeatedly filter out-of-bounds readings, transform coordinate frames, and decimate data streams.
+
+Pre-C++20 implementations typically created intermediate vectors (e.g., using `std::copy_if` followed by `std::transform`), causing dynamic heap allocations and non-deterministic latency jitter in real-time control loops.
+
+C++20 introduces **Ranges** and **Views** (`#include <ranges>`). A view is a lightweight, non-owning abstraction that wraps an iterable range and evaluates operations **lazily** (on demand) as elements are accessed. No intermediate heap buffers are allocated.
+
+#### 1. Composable Pipeline with the Pipe (`|`) Operator
+
+Views compose cleanly using the Unix-style pipe syntax:
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <ranges>
+#include <algorithm>
+#include <cmath>
+
+struct LidarPoint {
+    float x, y, z;
+    float intensity;
+};
+
+int main() {
+    std::vector<LidarPoint> raw_scan = {
+        {0.05f, 0.1f, 0.0f, 10.0f},   // Noise: too close to chassis (< 0.2m)
+        {12.4f, 3.2f, 0.5f, 85.0f},   // Valid obstacle
+        {45.0f, 1.0f, -0.2f, 5.0f},   // Noise: out of max range (> 30m) or low reflection
+        {8.1f, -2.5f, 0.1f, 120.0f}   // Valid obstacle
+    };
+
+    // Zero-allocation pipeline:
+    // 1. Filter: discard hardware noise and out-of-range returns
+    // 2. Transform: compute 2D planar Euclidean distance on the fly
+    // 3. Take: limit to first N valid points
+    auto valid_distances = raw_scan
+        | std::views::filter([](const LidarPoint& p) {
+            float dist = std::hypot(p.x, p.y);
+            return dist >= 0.2f && dist <= 30.0f && p.intensity > 20.0f;
+        })
+        | std::views::transform([](const LidarPoint& p) {
+            return std::hypot(p.x, p.y);
+        })
+        | std::views::take(100);
+
+    // Elements are computed on the fly during iteration.
+    // No intermediate std::vector<float> is allocated on the heap!
+    for (float range : valid_distances) {
+        std::cout << "[LIDAR] Valid target distance: " << range << " m\n";
+    }
+}
+```
+
+#### 2. Direct Container Algorithms & Projections (`std::ranges::`)
+
+In C++17, STL algorithms required explicit `.begin()` and `.end()` iterator pairs and custom lambda comparators. C++20 `std::ranges` algorithms accept the container directly and support **projections**:
+
+```cpp
+#include <ranges>
+#include <algorithm>
+#include <vector>
+
+struct Waypoint {
+    int id;
+    double x, y;
+};
+
+std::vector<Waypoint> path = {{3, 10.0, 5.0}, {1, 2.0, 1.0}, {2, 5.0, 3.0}};
+
+// Pre-C++20: requires begin/end and custom comparator lambda
+// std::sort(path.begin(), path.end(), [](const Waypoint& a, const Waypoint& b) { return a.id < b.id; });
+
+// C++20 Ranges: directly pass container and project onto member variable
+std::ranges::sort(path, std::ranges::less{}, &Waypoint::id);
+```
+
+> [!WARNING]
+> **Dangling View Hazard**: Views do not own their underlying data. Never return a view over a local stack container that goes out of scope at function return. If you need to persist or return the transformed sequence across function boundaries, materialize it into an owning container or use C++23 `std::ranges::to<std::vector>()`.
 
 <a name="module-05-invalidation"></a>
 ### Deep Dive: Iterator Invalidation
@@ -2924,6 +3007,115 @@ private:
 int main() {
     Node n1;
     n1.setRate(50).printAddress(); // Method chaining via '*this'
+}
+```
+
+<a name="module-10-deducing-this"></a>
+#### Future-Proofing: C++23 Explicit Object Parameters ("Deducing this")
+
+Prior to C++23, member functions received an implicit `this` pointer passed behind the scenes. While effective, this created limitations when implementing high-performance robotics mathematical wrappers and generic sensor interfaces.
+
+C++23 introduces **Explicit Object Parameters** (commonly known as **Deducing this**). You can now declare the calling object explicitly as the first parameter of a member function using `this Self&& self`.
+
+This language enhancement addresses three major patterns in robotics engineering:
+
+##### 1. Eliminating 4-Way Accessor Duplication
+
+When exposing internal buffers or matrix payloads (e.g., in a high-rate IMU packet or point cloud wrapper), maintaining `const` and value-category correctness previously required four repetitive overloads:
+
+```cpp
+// Legacy approach: 4 repetitive member function overloads
+class SensorPacket {
+public:
+    std::vector<double>& data() & { return data_; }
+    const std::vector<double>& data() const& { return data_; }
+    std::vector<double>&& data() && { return std::move(data_); }
+    const std::vector<double>&& data() const&& { return std::move(data_); }
+private:
+    std::vector<double> data_;
+};
+```
+
+With C++23 explicit object parameters, a single templated accessor handles lvalues, const lvalues, rvalues, and const rvalues with perfect forwarding:
+
+```cpp
+#include <utility>
+#include <vector>
+
+class SensorPacket {
+public:
+    template <typename Self>
+    auto&& data(this Self&& self) {
+        return std::forward<Self>(self).data_;
+    }
+private:
+    std::vector<double> data_;
+};
+```
+
+##### 2. Static Polymorphism Without CRTP Boilerplate
+
+In hard real-time control loops, virtual table dispatch is often avoided because dynamic dispatch introduces pointer indirection and prevents compiler inlining. Historically, engineers used the **Curiously Recurring Template Pattern (CRTP)**, which required templated base classes and awkward `static_cast<Derived*>(this)` syntax.
+
+With C++23, the base class does not need to be a template at all:
+
+```cpp
+#include <iostream>
+
+// Base interface does NOT require template parameter <Derived>
+struct MotorDriver {
+    template <typename Self>
+    void set_speed(this Self& self, double speed_rad_s) {
+        // Dispatches directly to derived implementation at compile time with zero overhead
+        self.apply_voltage(speed_rad_s * 0.05);
+    }
+};
+
+struct CanBusMotor : public MotorDriver {
+    void apply_voltage(double volts) {
+        std::cout << "[CAN] Commanded voltage: " << volts << "V\n";
+    }
+};
+
+int main() {
+    CanBusMotor motor;
+    motor.set_speed(100.0); // Directly inlines derived implementation
+}
+```
+
+##### 3. Recursive Lambdas Without Heap Allocations
+
+When traversing hierarchical robot data structures (such as kinematic link trees, URDF scenes, or spatial octrees), recursive lambdas previously relied on `std::function`, which incurs dynamic heap allocation. In C++23, a lambda can pass itself explicitly:
+
+```cpp
+#include <string>
+#include <vector>
+#include <iostream>
+
+struct RobotLink {
+    std::string name;
+    std::vector<RobotLink> children;
+};
+
+int main() {
+    RobotLink root{
+        "base_link",
+        {
+            {"torso", {{"arm_left", {}}, {"arm_right", {}}}},
+            {"pan_tilt_head", {}}
+        }
+    };
+
+    // Recursive lambda without std::function or heap allocation
+    auto print_tree = [](this auto&& self, const RobotLink& link, int depth = 0) -> void {
+        for (int i = 0; i < depth; ++i) std::cout << "  ";
+        std::cout << "- " << link.name << '\n';
+        for (const auto& child : link.children) {
+            self(child, depth + 1);
+        }
+    };
+
+    print_tree(root);
 }
 ```
 
